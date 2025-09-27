@@ -13,20 +13,22 @@ from streamlit_folium import st_folium
 from dotenv import load_dotenv
 import os
 import google.generativeai as genai
+from google.api_core.exceptions import ResourceExhausted
+import duckdb
 
-# Load environment variables
 load_dotenv()
-DB_NAME = st.secrets.get("DB_NAME", os.getenv("DB_NAME"))
-DB_USER = st.secrets.get("DB_USER", os.getenv("DB_USER"))
-DB_PASS = st.secrets.get("DB_PASSWORD", os.getenv("DB_PASSWORD"))
-DB_HOST = st.secrets.get("DB_HOST", os.getenv("DB_HOST"))
-DB_PORT = st.secrets.get("DB_PORT", os.getenv("DB_PORT"))
+
+os.environ["GRPC_VERBOSITY"] = "ERROR"
+os.environ["GRPC_TRACE"] = ""
 GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY", os.getenv("GEMINI_API_KEY"))
 
-# Configure DB engine
-engine = sqlalchemy.create_engine(
-    f"postgresql+psycopg2://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
-)
+DUCKDB_CONN = duckdb.connect(database=':memory:', read_only=False) 
+
+DUCKDB_CONN.execute("""
+    CREATE TABLE argo_profiles AS
+    SELECT * FROM 'argo_data.parquet'
+    LIMIT 100000
+""")
 
 st.set_page_config(
     page_title="FloatChat AI - ARGO Ocean Data Explorer", 
@@ -60,9 +62,17 @@ model1 = genai.GenerativeModel(
 
 @st.cache_data(show_spinner=False)
 def load_data():
-    # Example: reading all or partial data from DB
-    query = "SELECT * FROM argo_profiles LIMIT 100000"
-    df = pd.read_sql(query, engine)
+    try:
+        df = pd.read_parquet("argo_data.parquet")
+    except FileNotFoundError:
+        st.error("Error: 'argo_data.parquet' not found. Please ensure the 1.5GB data file is uploaded.")
+        return pd.DataFrame()
+    except Exception as e:
+        st.error(f"Error reading Parquet file: {e}")
+        return pd.DataFrame()
+    
+    DUCKDB_CONN.register('argo_profiles', df)
+    
     return df
 
 if "df" not in st.session_state:
@@ -72,7 +82,7 @@ df = st.session_state.df
 
 # Prompt prefix for SQL LLM
 PROMPT_PREFIX = """
-    You are an expert in converting English questions to SQL code for a PostgreSQL + PostGIS database.!  
+    You are an expert in converting English questions to SQL code for a DUCKDB + PostGIS database.!  
     The SQL database has the name argo_profiles and has the following columns:  
     platform_number, cycle_number, juld (DATE), latitude, longitude, pres_adjusted, temp_adjusted, psal_adjusted, pres_adjusted_qc, temp_adjusted_qc, psal_adjusted_qc.
 
@@ -81,7 +91,7 @@ PROMPT_PREFIX = """
     SELECT MAX(temp_adjusted) FROM argo_profiles WHERE latitude BETWEEN -60 AND 30 AND longitude BETWEEN 20 AND 120;
 
     Example 2 - What is the average salinity in the Arabian Sea in 2020?  
-    SELECT AVG(psal_adjusted) FROM argo_profiles WHERE latitude BETWEEN 5 AND 25 AND longitude BETWEEN 50 AND 90 AND EXTRACT(YEAR FROM juld) = 2020;
+    SELECT AVG(psal_adjusted) FROM argo_profiles WHERE latitude BETWEEN 5 AND 25 AND longitude BETWEEN 50 AND 90 AND DATE_PART('year', juld) = 2020;
 
     Example 3 - Show all profiles where temp_adjusted_qc = '1'.  
     SELECT * FROM argo_profiles WHERE temp_adjusted_qc = '1';
@@ -90,10 +100,10 @@ PROMPT_PREFIX = """
     SELECT temp_adjusted, psal_adjusted FROM argo_profiles WHERE platform_number = 7689;
 
     Example 5 - Give the temperature trend in the Bay of Bengal for the last 5 years.  
-    SELECT EXTRACT(YEAR FROM juld) AS year, AVG(temp_adjusted) AS avg_temp FROM argo_profiles WHERE latitude BETWEEN 5 AND 25 AND longitude BETWEEN 80 AND 100 AND juld >= (CURRENT_DATE - INTERVAL '5 years') GROUP BY year ORDER BY year;
+    SELECT DATE_PART('year', juld) AS year, AVG(temp_adjusted) AS avg_temp FROM argo_profiles WHERE latitude BETWEEN 5 AND 25 AND longitude BETWEEN 80 AND 100 AND juld >= DATEDIFF('year', 5, CURRENT_DATE()) GROUP BY year ORDER BY year;
 
     Example 6 - Find the 5 closest profiles to coordinates 12.200,94.719.  
-    SELECT platform_number, latitude, longitude  FROM argo_profiles a WHERE platform_number IN (SELECT DISTINCT platform_number FROM argo_profiles) ORDER BY SQRT(POWER(latitude - 12.200, 2) + POWER(longitude - 94.719, 2)) LIMIT 5;     
+    SELECT platform_number, latitude, longitude FROM argo_profiles ORDER BY SQRT(POW(latitude - 12.200, 2) + POW(longitude - 94.719, 2)) LIMIT 5;     
     
     Example 7 - Find the average temperature and salinity for deepest 20% pressures per platform  
     WITH ranked AS ( SELECT *, PERCENT_RANK() OVER (PARTITION BY platform_number ORDER BY pres_adjusted DESC) AS pr FROM argo_profiles ) SELECT platform_number, AVG(temp_adjusted) AS avg_temp, AVG(psal_adjusted) AS avg_salinity FROM ranked WHERE pr >= 0.8 GROUP BY platform_number ORDER BY platform_number DESC;
@@ -409,21 +419,32 @@ def safe_execute(sql):
         raise ValueError("Invalid SQL syntax generated.")
     if not is_safe_query(sql):
         raise ValueError("Unsafe SQL detected (non-SELECT or dangerous keyword).")
-    return read_sql_query(sql)
+    
+    try:
+        result_df = DUCKDB_CONN.execute(sql).fetchdf()
+        return result_df.to_dict('records')
+    except Exception as e:
+        raise ValueError(f"DuckDB Query Execution Error: {e}")
 
 def generate_gemini_response(question, prompt_prefix):
     max_retries = 2
     prompt_parts = [prompt_prefix, question]
     attempt = 0
     while attempt <= max_retries:
+        print("Calling Gemini for SQL")
         response = model.generate_content(prompt_parts)
         sql = response.text.strip()
         try:
             output = safe_execute(sql)
+            print(output)
             return {"sql": sql, "results": output}
         except ValueError as e:
             prompt_parts.append(f"⚠️ Invalid SQL: {e}. Please fix it and try again.")
+            print("Error occured:",e)
             attempt += 1
+        except ResourceExhausted as e:
+            st.error("⚠️ Gemini quota exceeded. Please wait and retry later.")
+            print("Quota error:", e)
     return {"error": "Failed to generate valid SQL."}
 
 def generate_summary_llm(question, sql, results):
@@ -439,7 +460,9 @@ def generate_summary_llm(question, sql, results):
     {table_str}
     Respond in 4 concise bullet points focusing on data.
     """
+    print("Calling gemini for Summary")
     summary_response = model1.generate_content(prompt)
+    print(summary_response)
     return summary_response.text.strip()
 
 def query_backend(question):
@@ -573,15 +596,8 @@ if st.session_state.current_view == 'chat':
         if not error:
             df_result = pd.DataFrame(results) if results else pd.DataFrame()
 
-            formatted_response = f"""
-{sql}
-                </pre>
-
-**Summary:**
-                    {summary.replace('- ', '• ')}
-               
-            """
-
+            formatted_response = f"""{sql}</pre>**Summary:**{summary.replace('- ', '• ')}"""
+            print(formatted_response)
             st.session_state.messages.append({
                 "role": "assistant",
                 "content": formatted_response,
@@ -632,7 +648,7 @@ elif st.session_state.current_view == 'visualize':
     with tab1:
         st.subheader("🌍 Global Ocean Float Distribution")
         if 'latitude' in df.columns and 'longitude' in df.columns:
-            sample_df = df.sample(min(2000, len(df)))
+            sample_df = df.sample(min(500, len(df)))
             cols_to_keep = ["latitude", "longitude"]
             if "temp_adjusted" in sample_df.columns:
                 cols_to_keep.append("temp_adjusted")

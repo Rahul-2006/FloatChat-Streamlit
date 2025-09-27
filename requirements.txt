@@ -20,3 +20,5 @@ requests
 xarray
 bs4
 tabulate
+duckdb
+pyarrow
