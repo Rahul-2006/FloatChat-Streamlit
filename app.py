@@ -28,6 +28,11 @@ engine = sqlalchemy.create_engine(
     f"postgresql+psycopg2://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 )
 
+st.set_page_config(
+    page_title="FloatChat AI - ARGO Ocean Data Explorer", 
+    layout="wide",
+    initial_sidebar_state="collapsed"
+)
 # Configure Gemini AI
 genai.configure(api_key=GEMINI_API_KEY)
 generation_config = {
