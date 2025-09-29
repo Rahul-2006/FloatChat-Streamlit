@@ -143,6 +143,11 @@ df = st.session_state.df
 # Prompt prefix for SQL LLM
 PROMPT_PREFIX = f"""
     You are an expert in converting English questions to SQL code for a DUCKDB + PostGIS database.!  
+    If the user asks a generic question (such as asking about you, about oceans generally, greetings, or 
+    fact-based questions unrelated to the database,), give a brief, 
+    helpful conversational answer instead. 
+    In such cases, DO NOT generate or return any SQL query.
+
     The SQL database has the name argo_profiles and has the following columns:  
     platform_number, cycle_number, juld (DATE), latitude, longitude, pres_adjusted, temp_adjusted, psal_adjusted, pres_adjusted_qc, temp_adjusted_qc, psal_adjusted_qc.
     Also use {water_bodies} for the exact latitude and longitude
@@ -171,6 +176,8 @@ PROMPT_PREFIX = f"""
     Example 8 - Find a float with temperature between 25 and 30 and psal between 10 and 20
     SELECT DISTINCT platform_number FROM argo_profiles WHERE temp_adjusted BETWEEN 25 AND 30 AND psal_adjusted BETWEEN 10 AND 20;
     
+    Example 9 - Who are you?
+    I am your intelligent ocean data assistant! I help answer questions about ocean measurements and trends.
     Dont include ```
     """
 # Styling and ocean header
@@ -453,7 +460,11 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-# Helper functions for safe SQL validation, execution, AI generate, summary ...
+def looks_like_sql(text):
+    sql_keywords = ("SELECT", "WITH", "INSERT", "UPDATE", "DELETE")
+    return text.strip().upper().startswith(sql_keywords)
+
+# safe SQL validation
 def validate_sql_syntax(sql: str) -> bool:
     """Attempt to parse SQL and ensure statement is nonempty."""
     try:
@@ -499,20 +510,23 @@ def generate_gemini_response(question, prompt_prefix):
         response = model.generate_content(prompt_parts)
         sql = response.text.strip()
         print(sql)
-        try:
-            output = safe_execute(sql)
-            print(output)
-            return {"sql": sql, "results": output}
-        except ValueError as e:
-            prompt_parts.append(f"⚠️ Invalid SQL: {e}. Please fix it and try again.")
-            print("Error occured:",e)
-            attempt += 1
-        except ResourceExhausted as e:
-            st.error("⚠️ Gemini quota exceeded. Please wait and retry later.")
-            print("Quota error:", e)
-        except Exception as e:
-            st.error(f"Error occured {e}")
-            print(f"Error: {e}")
+        if looks_like_sql(sql):
+            try:
+                output = safe_execute(sql)
+                print(output)
+                return {"sql": sql, "results": output,"summary_needed": True}
+            except ValueError as e:
+                prompt_parts.append(f"⚠️ Invalid SQL: {e}. Please fix it and try again.")
+                print("Error occured:",e)
+                attempt += 1
+            except ResourceExhausted as e:
+                st.error("⚠️ Gemini quota exceeded. Please wait and retry later.")
+                print("Quota error:", e)
+            except Exception as e:
+                st.error(f"Error occured {e}")
+                print(f"Error: {e}")
+        else:
+            return {"sql": "", "results": [], "summary": sql, "error": ""}
     return {"error": "Failed to generate valid SQL."}
 
 def generate_summary_llm(question, sql, results):
@@ -553,7 +567,11 @@ def query_backend(question):
     response = generate_gemini_response(question, PROMPT_PREFIX)
     sql = response.get("sql", "")
     results = response.get("results", [])
-    summary = generate_summary_llm(question, sql, results) if "error" not in response else ""
+    if "summary_needed" in response and response["summary_needed"]:
+        summary = generate_summary_llm(question, sql, results) if "error" not in response else ""
+    else:
+        summary = response.get("summary", "")
+
     return {
         "sql": sql,
         "results": results,
@@ -676,19 +694,21 @@ if st.session_state.current_view == 'chat':
         sql = response.get("sql", "")
         summary = response.get("summary", "")
         results = response.get("results", [])
-        
-        if not error:
-            df_result = pd.DataFrame(results) if results else pd.DataFrame()
 
-            formatted_response = f""" <strong>SQL Used:</strong> {sql}</pre> <pre><strong>Summary:</strong> {summary.replace('- ', '• ')}</pre>"""
-            print(sql)
-            print(summary)
+        if error:
+            st.session_state.messages.append({
+                "role": "assistant",
+                "content": f"⚠️ Error: {error}",
+                "type": "text"
+            })
+        elif sql:
+            df_result = pd.DataFrame(results) if results else pd.DataFrame()
+            formatted_response = f""" <strong>SQL Used:</strong> <pre>{sql}</pre>\n<strong>Summary:</strong>\n{summary.replace('- ', '• ')}"""
             st.session_state.messages.append({
                 "role": "assistant",
                 "content": formatted_response,
                 "type": "html"
             })
-
             if not df_result.empty:
                 st.session_state.messages.append({
                     "role": "assistant",
@@ -696,8 +716,14 @@ if st.session_state.current_view == 'chat':
                     "type": "dataframe",
                     "dataframe": df_result
                 })
-
-                st.rerun()
+            st.rerun()
+        else:
+            st.session_state.messages.append({
+                "role": "assistant",
+                "content": summary,
+                "type": "text"
+            })
+            st.rerun()
 
 # Additional CSS to prevent duplication
     st.markdown("""
