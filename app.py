@@ -27,6 +27,7 @@ DUCKDB_CONN = duckdb.connect(database=':memory:', read_only=False)
 DUCKDB_CONN.execute("""
     CREATE TABLE argo_profiles AS
     SELECT * FROM 'argo_data.parquet'
+    ORDER BY RANDOM()
     LIMIT 100000
 """)
 
