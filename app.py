@@ -78,8 +78,7 @@ water_bodies = {
     "Ceylon Sea": {"lat_min": 5, "lat_max": 10, "lon_min": 79, "lon_max": 84},
 
     # Atlantic Ocean & seas
-    "North Atlantic Ocean": {"lat_min": 0, "lat_max": 60, "lon_min": -80, "lon_max": 20},
-    "South Atlantic Ocean": {"lat_min": -60, "lat_max": 0, "lon_min": -70, "lon_max": 20},
+    "Atlantic Ocean": {"lat_min": -60, "lat_max": 60, "lon_min": -80, "lon_max": 20},
     "Caribbean Sea": {"lat_min": 9, "lat_max": 22, "lon_min": -85, "lon_max": -60},
     "Sargasso Sea": {"lat_min": 20, "lat_max": 35, "lon_min": -80, "lon_max": -40},
     "Mediterranean Sea": {"lat_min": 30, "lat_max": 46, "lon_min": -6, "lon_max": 36},
@@ -89,8 +88,7 @@ water_bodies = {
     "Labrador Sea": {"lat_min": 55, "lat_max": 65, "lon_min": -60, "lon_max": -40},
 
     # Pacific Ocean & seas (split at 180°)
-    "North Pacific Ocean": {"lat_min": 0, "lat_max": 65, "lon_min": -180, "lon_max": -70},
-    "South Pacific Ocean": {"lat_min": -60, "lat_max": 0, "lon_min": 110, "lon_max": 180},
+    "Pacific Ocean": {"lat_min": -60, "lat_max": 65, "lon_min": -180, "lon_max": -70},
     "Philippine Sea": {"lat_min": 5, "lat_max": 25, "lon_min": 125, "lon_max": 150},
     "Coral Sea": {"lat_min": -25, "lat_max": -10, "lon_min": 145, "lon_max": 160},
     "South China Sea": {"lat_min": 0, "lat_max": 25, "lon_min": 105, "lon_max": 120},
@@ -124,9 +122,13 @@ water_bodies = {
 @st.cache_data(show_spinner=False)
 def load_data():
     try:
-        df = pd.read_parquet("argo_data.parquet")
+        df = DUCKDB_CONN.execute("""
+            SELECT *
+            FROM 'argo_profiles.parquet'
+            USING SAMPLE 100000 ROWS;
+        """).df()
     except FileNotFoundError:
-        st.error("Error: 'argo_data.parquet' not found. Please ensure the 1.5GB data file is uploaded.")
+        st.error("Error: 'argo_profiles.parquet' not found. Please ensure the 1.5GB data file is uploaded.")
         return pd.DataFrame()
     except Exception as e:
         st.error(f"Error reading Parquet file: {e}")
@@ -152,7 +154,8 @@ PROMPT_PREFIX = f"""
     The SQL database has the name argo_profiles and has the following columns:  
     platform_number, cycle_number, juld (DATE), latitude, longitude, pres_adjusted, temp_adjusted, psal_adjusted, pres_adjusted_qc, temp_adjusted_qc, psal_adjusted_qc.
     Also use {water_bodies} for the exact latitude and longitude
-    For example,  
+    QC = 3,4,9 are considered as failed measurements
+    For example,
     Example 1 - What is the maximum temperature in the Indian Ocean?  
     SELECT MAX(temp_adjusted) FROM argo_profiles WHERE latitude BETWEEN -60 AND 30 AND longitude BETWEEN 20 AND 120;
 
@@ -760,7 +763,7 @@ elif st.session_state.current_view == 'visualize':
     with tab1:
         st.subheader("🌍 Global Ocean Float Distribution")
         if 'latitude' in df.columns and 'longitude' in df.columns:
-            sample_df = df.sample(min(500, len(df)))
+            sample_df = df.sample(min(1000, len(df)))
             cols_to_keep = ["latitude", "longitude"]
             if "temp_adjusted" in sample_df.columns:
                 cols_to_keep.append("temp_adjusted")
@@ -882,12 +885,15 @@ elif st.session_state.current_view == 'visualize':
         st.subheader("🌐 3D Ocean Data Visualization")
         
         num_points = min(1000, len(df))
-        float_sample = df.sample(num_points)
-
+        float_sample = df.sample(min(1000, len(df)))
+        cols_to_keep = ["latitude", "longitude"]
+        map_df = float_sample[cols_to_keep].copy()
+        map_df = map_df.dropna(subset = ['latitude','longitude'])
+        map_df = map_df.astype(float, errors="ignore")
+        map_df = map_df.reset_index(drop=True)
         points_data = []
-        labels_data = []
 
-        for _, row in float_sample.iterrows():
+        for _, row in map_df.iterrows():
             points_data.append({
                 'lat': float(row['latitude']),
                 'lng': float(row['longitude']),
